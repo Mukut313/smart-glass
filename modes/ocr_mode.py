@@ -1,10 +1,27 @@
 """
-OCR Mode — Bangla + English text reading via EasyOCR.
+OCR Mode — Bangla + English text reading via a hybrid EasyOCR + PaddleOCR
+pipeline.
 
 Triggered only on ACTION button press (not continuous) to avoid
-blocking the CPU. EasyOCR is lazy-loaded on first activation so the
-application starts quickly and ~600 MB of model weight doesn't sit
-in RAM while another mode is active.
+blocking the CPU. Both engines are lazy-loaded on first activation so the
+application starts quickly and the model weight doesn't sit in RAM while
+another mode is active.
+
+Why hybrid instead of switching outright to PaddleOCR:
+  Lightweight/standard PaddleOCR ships NO Bangla recognition model (Bangla
+  is only available in the very heavy PaddleOCR-VL vision-language model,
+  which is not practical on an RPi 5). EasyOCR's Reader(["bn", "en"])
+  remains the only realistic offline engine that detects text regions AND
+  recognises Bangla. So:
+    - EasyOCR stays the PRIMARY engine — it detects every line/box and
+      recognises Bangla text.
+    - For lines EasyOCR judges to be Latin/English script, PaddleOCR
+      (lang="en") re-recognises just that cropped region — PaddleOCR's
+      Latin-script recognition is noticeably more accurate than EasyOCR's.
+      Its reading is used only when it scores at least as confidently as
+      EasyOCR's, so this can only improve English accuracy, never worsen it.
+  If PaddleOCR/paddlepaddle isn't installed (e.g. no ARM64 wheel available
+  for a given RPi OS image), the mode degrades gracefully to EasyOCR-only.
 """
 import logging
 import re
@@ -28,6 +45,20 @@ logger = logging.getLogger("smart_glass.ocr_mode")
 # before they reach the TTS queue.
 _CONTENT_RE = re.compile(r"[^\W_]", re.UNICODE)
 _MIN_CONTENT_RATIO = 0.5
+
+# A line is a candidate for PaddleOCR refinement only when it contains
+# Latin letters and NO Bangla script — mixed-script lines stay with
+# EasyOCR's reading since PaddleOCR(lang="en") cannot recognise Bangla
+# at all (it would just drop or mangle that part of the line).
+_LATIN_RE  = re.compile(r"[A-Za-z]")
+_BANGLA_RE = re.compile(r"[ঀ-৿]")
+
+
+def _is_latin_only(text: str) -> bool:
+    stripped = text.replace(" ", "")
+    if not stripped:
+        return False
+    return bool(_LATIN_RE.search(stripped)) and not _BANGLA_RE.search(stripped)
 
 
 def _looks_like_text(text: str) -> bool:
@@ -57,7 +88,9 @@ def _reading_order_key(item):
 class OCRMode(BaseMode):
 
     def __init__(self) -> None:
-        self._reader = None   # lazy-loaded
+        self._reader = None   # EasyOCR  — primary: detection + bn/en recognition (lazy-loaded)
+        self._paddle = None   # PaddleOCR — secondary: higher-accuracy Latin/English re-recognition (lazy, optional)
+        self._paddle_unavailable = False  # set once import/init fails so we don't retry every activate()
 
         # Capture and playback are two separate steps: the CAPTURE button
         # snaps a frame, runs OCR, and stores the result here; the READ
@@ -87,11 +120,31 @@ class OCRMode(BaseMode):
                 logger.error("Failed to load EasyOCR: %s", exc)
                 self._reader = None
 
+        if self._paddle is None and not self._paddle_unavailable:
+            logger.info("Loading PaddleOCR model (English refinement) — first use…")
+            try:
+                from paddleocr import PaddleOCR
+                # lang="en": PaddleOCR has no Bangla model, so it is only ever
+                # used to re-recognise lines EasyOCR already judged Latin-only.
+                self._paddle = PaddleOCR(use_angle_cls=True, lang="en")
+                logger.info("PaddleOCR ready (English refinement enabled)")
+            except Exception as exc:
+                # Common on RPi: no prebuilt ARM64 paddlepaddle wheel for the
+                # OS image. Not fatal — just keep using EasyOCR for English.
+                logger.warning(
+                    "PaddleOCR unavailable (%s) — continuing with EasyOCR only "
+                    "for English text. To enable higher-accuracy English "
+                    "recognition: pip install paddleocr paddlepaddle", exc
+                )
+                self._paddle = None
+                self._paddle_unavailable = True
+
     def deactivate(self) -> None:
         logger.info("OCR mode deactivated")
 
     def cleanup(self) -> None:
         self._reader = None
+        self._paddle = None
 
     # ------------------------------------------------------------------
     # Core processing
@@ -133,9 +186,10 @@ class OCRMode(BaseMode):
         # EasyOCR detail=1 always returns (bbox, text, conf) 3-tuples
         texts = []
         for item in results:
+            bbox = None
             if len(item) == 3:
-                _bbox, text, conf = item
-            elif len(item) == 2:          # fallback: (text, conf)
+                bbox, text, conf = item
+            elif len(item) == 2:          # fallback: (text, conf) — no bbox available
                 text, conf = item
             else:
                 continue
@@ -145,6 +199,17 @@ class OCRMode(BaseMode):
             if not _looks_like_text(text):
                 logger.debug("Discarding non-text OCR fragment (conf=%.2f): %r", conf, text)
                 continue
+
+            # Hybrid refinement: lines that are purely Latin script get a
+            # second opinion from PaddleOCR, which reads English noticeably
+            # more accurately than EasyOCR. We only swap in its reading when
+            # it is at least as confident — this can only help, never hurt.
+            if self._paddle is not None and bbox is not None and _is_latin_only(text):
+                refined = self._refine_with_paddle(preprocessed, bbox, text, conf)
+                if refined:
+                    logger.debug("PaddleOCR refined %r -> %r", text, refined)
+                    text = refined
+
             texts.append(text)
 
         if not texts:
@@ -177,6 +242,57 @@ class OCRMode(BaseMode):
         if self._stored_lang == "bn":
             return "পড়া হচ্ছে: " + self._stored_text   # "Reading: ..."
         return "Reading: " + self._stored_text
+
+    # ------------------------------------------------------------------
+    # PaddleOCR refinement (Latin-script lines only)
+    # ------------------------------------------------------------------
+
+    def _refine_with_paddle(self, image: np.ndarray, bbox, fallback_text: str,
+                            fallback_conf: float) -> Optional[str]:
+        """
+        Crop the line EasyOCR detected (using its bbox) and re-run it
+        through PaddleOCR, which is meaningfully more accurate on Latin
+        script. Returns the PaddleOCR reading only if it is at least as
+        confident as EasyOCR's — otherwise returns None and the caller
+        keeps the original EasyOCR text. Any failure here is swallowed;
+        refinement is a pure bonus and must never break the main flow.
+        """
+        try:
+            xs = [int(round(pt[0])) for pt in bbox]
+            ys = [int(round(pt[1])) for pt in bbox]
+            x1, x2 = max(min(xs), 0), max(xs)
+            y1, y2 = max(min(ys), 0), max(ys)
+            if x2 - x1 < 6 or y2 - y1 < 6:
+                return None
+
+            # Small margin so PaddleOCR isn't fed a too-tight crop
+            pad = 3
+            y1, x1 = max(y1 - pad, 0), max(x1 - pad, 0)
+            y2 = min(y2 + pad, image.shape[0])
+            x2 = min(x2 + pad, image.shape[1])
+
+            crop = image[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+            if crop.ndim == 2:   # PaddleOCR expects a 3-channel image
+                crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+
+            result = self._paddle.ocr(crop, cls=True)
+            if not result or not result[0]:
+                return None
+
+            lines = [ln for ln in result[0] if ln and ln[1] and ln[1][0]]
+            if not lines:
+                return None
+
+            paddle_text = " ".join(ln[1][0].strip() for ln in lines if ln[1][0].strip())
+            paddle_conf = min(float(ln[1][1]) for ln in lines)
+
+            if paddle_text and _looks_like_text(paddle_text) and paddle_conf >= fallback_conf:
+                return paddle_text
+        except Exception as exc:
+            logger.debug("PaddleOCR refinement skipped (%s)", exc)
+        return None
 
     # ------------------------------------------------------------------
     # Preprocessing

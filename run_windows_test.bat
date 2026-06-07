@@ -51,6 +51,14 @@ if errorlevel 1 (
 )
 
 echo.
+echo [2b/3] Installing PaddleOCR (hybrid English-accuracy refinement, optional) ...
+pip install paddlepaddle paddleocr
+if errorlevel 1 (
+    echo [WARN] PaddleOCR install failed — OCR mode will keep working using
+    echo        EasyOCR alone for English text. This step is optional.
+)
+
+echo.
 echo [3/3] Launching Smart Glass Windows Test ...
 echo        Controls: M = switch mode   A = read/detect   + / - = volume   Q = quit
 echo.

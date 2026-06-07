@@ -57,6 +57,21 @@ pip install \
     "numpy>=1.24.0" \
     "Pillow>=10.0.0"
 
+# --- Hybrid OCR: PaddleOCR for higher-accuracy English/Latin recognition ---
+# EasyOCR (installed above) stays the PRIMARY engine because it is the only
+# realistic offline engine with a Bangla model; PaddleOCR only re-reads
+# lines EasyOCR already judged to be pure Latin script (see ocr_mode.py).
+# A prebuilt ARM64 'paddlepaddle' wheel is NOT always published for every
+# RPi OS / Python combination, so this install is best-effort: if it fails,
+# the app simply falls back to EasyOCR-only for English and keeps working.
+echo "   Installing PaddleOCR (best-effort — optional English-accuracy boost)..."
+if ! pip install "paddlepaddle>=2.5.0" "paddleocr>=2.7.0"; then
+    echo "   PaddleOCR/paddlepaddle install failed (no ARM64 wheel for this"
+    echo "   OS/Python combo is common). That's OK — Smart Glass will keep"
+    echo "   using EasyOCR for English text. To retry later with a source"
+    echo "   build, see: https://www.paddlepaddle.org.cn/en/install/quick"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. Piper TTS — ARM64 binary + English voice model
 # ---------------------------------------------------------------------------

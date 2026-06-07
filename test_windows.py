@@ -18,7 +18,15 @@ Keyboard controls (click the window first):
   Q  ->  Quit
 
 Install:
-  pip install gtts pygame easyocr ultralytics torch torchvision numpy Pillow
+  pip install gtts pygame easyocr ultralytics torch torchvision numpy Pillow paddleocr paddlepaddle
+
+Note on PaddleOCR: this mirrors the hybrid OCR pipeline used on the Pi —
+EasyOCR stays the primary engine (it's the only one that reads Bangla),
+and PaddleOCR(lang="en") gives Latin/English lines a higher-accuracy
+second pass. Unlike RPi 5 (ARM64, where prebuilt wheels are scarce),
+Windows x64 wheels for paddlepaddle are published on PyPI, so this
+should install cleanly here. If it fails for any reason, OCR mode keeps
+working with EasyOCR alone — see modes/ocr_mode.py.
 """
 
 import os

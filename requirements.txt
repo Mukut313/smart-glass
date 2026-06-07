@@ -8,6 +8,16 @@ opencv-python-headless>=4.8.0
 torch>=2.1.0
 torchvision>=0.16.0
 
+# Hybrid OCR refinement: PaddleOCR re-recognises Latin/English-script lines
+# for higher accuracy (EasyOCR remains the only engine with Bangla support,
+# so it stays primary — see modes/ocr_mode.py for the full rationale).
+# NOTE: prebuilt ARM64 (RPi 5) wheels for paddlepaddle are not always
+# available on PyPI for every Raspberry Pi OS / Python version. The app
+# degrades gracefully to EasyOCR-only if this import fails, so treat this
+# as a "best effort" install — see install.sh step 3 for the ARM64 notes.
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0
+
 # GPIO — REQUIRED for RPi 5 (replaces incompatible RPi.GPIO)
 rpi-lgpio>=0.5
 
