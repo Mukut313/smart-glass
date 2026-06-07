@@ -146,6 +146,14 @@ class ObjectMode(BaseMode):
         if not os.path.isfile(config.LABELS_BN_PATH):
             logger.warning("Bangla labels not found at %s", config.LABELS_BN_PATH)
             return
-        with open(config.LABELS_BN_PATH, encoding="utf-8") as f:
-            self._labels_bn = json.load(f)
-        logger.info("Loaded %d Bangla labels", len(self._labels_bn))
+        try:
+            with open(config.LABELS_BN_PATH, encoding="utf-8") as f:
+                self._labels_bn = json.load(f)
+            logger.info("Loaded %d Bangla labels", len(self._labels_bn))
+        except Exception as exc:
+            # An uncaught error here would propagate out of activate() —
+            # crashing startup, or (via the mode-switch button callback)
+            # leaving the app with the mode index advanced but the new
+            # mode only half-activated. Fall back to English class names.
+            logger.error("Failed to load Bangla labels: %s", exc)
+            self._labels_bn = {}

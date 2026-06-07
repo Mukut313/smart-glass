@@ -58,6 +58,16 @@ logger = logging.getLogger("smart_glass.utils")
 # Bangla Unicode block: U+0980–U+09FF
 _BANGLA_RE = re.compile(r"[ঀ-৿]")
 
+# Split on sentence-ending punctuation (Bangla দাঁড়ি '।' included) so long
+# OCR results are spoken sentence-by-sentence with natural pauses instead
+# of one rushed, hard-to-follow block.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[।.!?])\s+")
+
+
+def split_sentences(text: str) -> list[str]:
+    parts = [p.strip() for p in _SENTENCE_SPLIT_RE.split(text) if p.strip()]
+    return parts or ([text] if text.strip() else [])
+
 
 def detect_language(text: str) -> str:
     """Return 'bn' if >25% of non-space characters are Bangla, else 'en'."""
@@ -66,6 +76,48 @@ def detect_language(text: str) -> str:
         return "en"
     bangla_count = len(_BANGLA_RE.findall(stripped))
     return "bn" if (bangla_count / len(stripped)) > 0.25 else "en"
+
+
+def split_language_segments(text: str) -> list[tuple[str, str]]:
+    """
+    Split mixed Bangla/English text into ordered (segment, lang) runs.
+
+    Speaking a mixed-script sentence as a single block forces the wrong
+    voice onto half of it (e.g. English words read with the Bangla
+    espeak-ng voice), which is what made OCR results sound garbled.
+    Splitting on script boundaries lets each run be queued and spoken
+    with its own voice while preserving the original reading order.
+    """
+    segments: list[tuple[str, str]] = []
+    current_lang: str | None = None
+    current_chars: list[str] = []
+
+    for ch in text:
+        if _BANGLA_RE.match(ch):
+            ch_lang = "bn"
+        elif ch.isspace():
+            ch_lang = current_lang or "en"
+        else:
+            ch_lang = "en"
+
+        if current_lang is None:
+            current_lang = ch_lang
+
+        if ch_lang != current_lang:
+            run = "".join(current_chars).strip()
+            if run:
+                segments.append((run, current_lang))
+            current_chars = [ch]
+            current_lang = ch_lang
+        else:
+            current_chars.append(ch)
+
+    if current_chars:
+        run = "".join(current_chars).strip()
+        if run:
+            segments.append((run, current_lang or "en"))
+
+    return segments
 
 
 # ---------------------------------------------------------------------------
@@ -92,19 +144,35 @@ class TTSEngine:
     # ------------------------------------------------------------------
 
     def speak(self, text: str, lang: str = "auto") -> None:
-        """Enqueue text for speech. Non-blocking; drops oldest if full."""
-        if not text or not text.strip():
+        """
+        Enqueue text for speech. Non-blocking; drops oldest if full.
+
+        When lang="auto", mixed Bangla/English text is split into
+        script-homogeneous runs (and each run further into sentences) so
+        every chunk is read by the correct voice, in order, with natural
+        pauses — rather than one block read entirely in the wrong voice.
+        """
+        text = (text or "").strip()
+        if not text:
             return
+
         if lang == "auto":
-            lang = detect_language(text)
+            for seg_text, seg_lang in split_language_segments(text):
+                for sentence in split_sentences(seg_text):
+                    self._enqueue(sentence, seg_lang)
+        else:
+            for sentence in split_sentences(text):
+                self._enqueue(sentence, lang)
+
+    def _enqueue(self, text: str, lang: str) -> None:
         try:
-            self._queue.put_nowait((text.strip(), lang))
+            self._queue.put_nowait((text, lang))
         except queue.Full:
             try:
                 self._queue.get_nowait()   # drop oldest
             except queue.Empty:
                 pass
-            self._queue.put_nowait((text.strip(), lang))
+            self._queue.put_nowait((text, lang))
 
     def stop_current(self) -> None:
         """Interrupt currently playing audio immediately."""
@@ -147,24 +215,35 @@ class TTSEngine:
             text, lang = self._queue.get()
             try:
                 self._synthesize(text, lang)
+                # Brief pause between consecutive utterances — without this,
+                # back-to-back queue items run together and sound like one
+                # rushed, unintelligible block.
+                time.sleep(config.TTS_INTER_UTTERANCE_PAUSE)
             except Exception as exc:
                 logger.warning("TTS error: %s", exc)
             finally:
                 self._queue.task_done()
 
     def _synthesize(self, text: str, lang: str) -> None:
-        """Choose Piper or espeak-ng and play audio."""
+        """Choose Piper or espeak-ng and play audio.
+
+        Both languages try Piper first (natural-sounding neural voice) and
+        fall back to espeak-ng only if the matching Piper model isn't
+        installed. Previously Bangla always used espeak-ng even when a
+        Piper Bangla model was configured, which is why Bangla sounded
+        noticeably more robotic/unclear than English.
+        """
         if lang == "bn":
-            self._espeak(text, config.ESPEAK_VOICE_BN)
-            return
-
-        # Try Piper for English
-        if os.path.isfile(config.PIPER_EN_MODEL) and os.path.isfile(config.PIPER_BINARY):
-            self._piper(text, config.PIPER_EN_MODEL)
+            model_path, fallback_voice = config.PIPER_BN_MODEL, config.ESPEAK_VOICE_BN
         else:
-            self._espeak(text, config.ESPEAK_VOICE_EN)
+            model_path, fallback_voice = config.PIPER_EN_MODEL, config.ESPEAK_VOICE_EN
 
-    def _piper(self, text: str, model_path: str) -> None:
+        if os.path.isfile(model_path) and os.path.isfile(config.PIPER_BINARY):
+            self._piper(text, model_path, fallback_voice)
+        else:
+            self._espeak(text, fallback_voice)
+
+    def _piper(self, text: str, model_path: str, fallback_voice: str) -> None:
         """Render via Piper and stream raw PCM to aplay."""
         try:
             piper_proc = subprocess.Popen(
@@ -189,7 +268,7 @@ class TTSEngine:
             piper_proc.wait()
         except Exception as exc:
             logger.debug("Piper failed (%s), falling back to espeak-ng", exc)
-            self._espeak(text, config.ESPEAK_VOICE_EN)
+            self._espeak(text, fallback_voice)
         finally:
             with self._lock:
                 self._current_proc = None
@@ -201,6 +280,8 @@ class TTSEngine:
                     "espeak-ng",
                     "-v", voice,
                     "-s", str(config.ESPEAK_SPEED),
+                    "-p", str(config.ESPEAK_PITCH),
+                    "-g", str(config.ESPEAK_WORD_GAP),
                     "-a", str(int(self._volume * 2)),  # espeak amplitude 0-200
                     text,
                 ],

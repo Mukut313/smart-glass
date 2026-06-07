@@ -7,6 +7,7 @@ application starts quickly and ~600 MB of model weight doesn't sit
 in RAM while another mode is active.
 """
 import logging
+import re
 from typing import Optional
 
 import cv2
@@ -17,6 +18,40 @@ from utils import detect_language
 from .base_mode import BaseMode
 
 logger = logging.getLogger("smart_glass.ocr_mode")
+
+# A detection only "looks like text" if at least half of its non-space
+# characters are letters or digits (Bangla, Latin, or Bangla numerals —
+# prices, phone numbers, room numbers etc. are meaningful to read aloud).
+# EasyOCR frequently emits short symbol/noise fragments (".. | --", "I I I",
+# stray punctuation from edges and textures) that pass the confidence +
+# length filters but are gibberish when read aloud — this catches those
+# before they reach the TTS queue.
+_CONTENT_RE = re.compile(r"[^\W_]", re.UNICODE)
+_MIN_CONTENT_RATIO = 0.5
+
+
+def _looks_like_text(text: str) -> bool:
+    stripped = text.replace(" ", "")
+    if not stripped:
+        return False
+    content_chars = len(_CONTENT_RE.findall(stripped))
+    return (content_chars / len(stripped)) >= _MIN_CONTENT_RATIO
+
+
+def _reading_order_key(item):
+    """Sort EasyOCR detections top-to-bottom, then left-to-right.
+
+    EasyOCR returns detections in whatever order its detector finds them,
+    which often does NOT match the natural reading order of the page —
+    joining them as-is interleaves unrelated lines into nonsense sentences.
+    Using the bounding box's top-left corner restores natural reading order.
+    """
+    if item and len(item) >= 1 and item[0]:
+        bbox = item[0]
+        xs = [pt[0] for pt in bbox]
+        ys = [pt[1] for pt in bbox]
+        return (min(ys), min(xs))
+    return (0, 0)
 
 
 class OCRMode(BaseMode):
@@ -71,7 +106,13 @@ class OCRMode(BaseMode):
             logger.warning("EasyOCR inference error: %s", exc)
             return "টেক্সট পড়তে সমস্যা হয়েছে"  # error reading text
 
-        # Filter by confidence and minimum length
+        # Restore natural top-to-bottom, left-to-right reading order before
+        # filtering — EasyOCR's detection order can interleave separate
+        # lines/blocks, which is the main reason combined output sounded
+        # jumbled and nonsensical.
+        results = sorted(results, key=_reading_order_key)
+
+        # Filter by confidence, minimum length, and "looks like real text"
         # EasyOCR detail=1 always returns (bbox, text, conf) 3-tuples
         texts = []
         for item in results:
@@ -81,8 +122,13 @@ class OCRMode(BaseMode):
                 text, conf = item
             else:
                 continue
-            if conf >= config.OCR_CONFIDENCE and len(text.strip()) >= config.OCR_MIN_CHARS:
-                texts.append(text.strip())
+            text = text.strip()
+            if conf < config.OCR_CONFIDENCE or len(text) < config.OCR_MIN_CHARS:
+                continue
+            if not _looks_like_text(text):
+                logger.debug("Discarding non-text OCR fragment (conf=%.2f): %r", conf, text)
+                continue
+            texts.append(text)
 
         if not texts:
             return "কোনো লেখা পাওয়া যায়নি"  # no text found

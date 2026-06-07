@@ -55,10 +55,13 @@ PIPER_BINARY   = "/usr/local/bin/piper"
 # ---------------------------------------------------------------------------
 ESPEAK_VOICE_BN  = "bn"      # espeak-ng Bangla voice code
 ESPEAK_VOICE_EN  = "en-us"   # espeak-ng English voice code
-ESPEAK_SPEED     = 150        # words per minute
+ESPEAK_SPEED     = 135        # words per minute — slower than default 150 for clarity
+ESPEAK_PITCH     = 45         # 0-99, default 50; slightly lower reads less shrill/robotic
+ESPEAK_WORD_GAP  = 4          # 1/100s pause between words — improves intelligibility
 DEFAULT_VOLUME   = 80         # percent (0–100)
 VOLUME_STEP      = 10         # percent per button press
 TTS_QUEUE_MAXSIZE = 5         # drop old items if queue fills
+TTS_INTER_UTTERANCE_PAUSE = 0.15  # seconds between queued utterances (sentences/segments)
 
 # ---------------------------------------------------------------------------
 # Inference Thresholds

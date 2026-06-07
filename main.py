@@ -52,6 +52,12 @@ class SmartGlass:
         # Buttons
         self._buttons = ButtonHandler()
 
+        # Guards a single OCR/currency inference at a time — EasyOCR/PyTorch
+        # calls take seconds on RPi 5, and the shared Reader/classifier
+        # isn't guaranteed safe to call concurrently from overlapping
+        # button-press threads (which also produced overlapping/garbled TTS).
+        self._inferring = threading.Event()
+
         # Detection thread
         self._detection_thread = threading.Thread(
             target=self._detection_loop, daemon=True, name="detection"
@@ -148,12 +154,22 @@ class SmartGlass:
             obj_mode.force_announce_now()
             return
 
-        # OCR and currency: run inference synchronously in a short-lived thread
-        # so we don't block the GPIO ISR thread
+        # OCR and currency: run inference in a short-lived thread so we don't
+        # block the GPIO ISR thread. Ignore the press if one is already
+        # running — overlapping calls would race on the shared EasyOCR
+        # Reader / classifier and queue overlapping, garbled TTS output.
+        if self._inferring.is_set():
+            logger.debug("Ignoring ACTION press — inference already in progress")
+            return
+        self._inferring.set()
+
         def _infer():
-            result = self._modes[mode_idx].process_frame(frame)
-            if result:
-                self._tts.speak(result)
+            try:
+                result = self._modes[mode_idx].process_frame(frame)
+                if result:
+                    self._tts.speak(result)
+            finally:
+                self._inferring.clear()
 
         threading.Thread(target=_infer, daemon=True, name="action-infer").start()
 
