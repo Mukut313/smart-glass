@@ -9,8 +9,10 @@ Tests all three Smart Glass modes on Windows using:
   - Keyboard keys instead of GPIO buttons
 
 Keyboard controls (click the window first):
-  M  ->  Cycle mode  (OCR -> Object -> Currency)
-  A  ->  ACTION      (read text / detect / currency)
+  M  ->  Cycle mode    (OCR -> Object -> Currency)
+  A  ->  CAPTURE       (OCR: snap + OCR + store text in session, doesn't speak it yet
+                        | Object/Currency: detect and announce immediately)
+  R  ->  READ          (OCR mode only: speak back the text captured by the last A press)
   +  ->  Volume up
   -  ->  Volume down
   Q  ->  Quit
@@ -284,12 +286,14 @@ class SmartGlassWin:
 
         self._modes[self._mode].activate()
         self._tts.speak("Smart Glass ready. Text Reading Mode.")
-        self._log("Ready — Text Reading Mode | M=switch  A=detect  +/-=vol  Q=quit")
+        self._log("Ready — Text Reading Mode | M=switch  A=capture  R=read  +/-=vol  Q=quit")
 
         root.bind("<Key-m>",     lambda e: self._switch_mode())
         root.bind("<Key-M>",     lambda e: self._switch_mode())
         root.bind("<Key-a>",     lambda e: self._action())
         root.bind("<Key-A>",     lambda e: self._action())
+        root.bind("<Key-r>",     lambda e: self._read_stored())
+        root.bind("<Key-R>",     lambda e: self._read_stored())
         root.bind("<Key-plus>",  lambda e: self._vol_up())
         root.bind("<Key-equal>", lambda e: self._vol_up())
         root.bind("<Key-minus>", lambda e: self._vol_down())
@@ -352,7 +356,7 @@ class SmartGlassWin:
         # Hint
         tk.Label(
             self._root,
-            text="  M = Mode    A = Detect / Read    + / - = Volume    Q = Quit  ",
+            text="  M = Mode    A = Capture / Detect    R = Read captured text    + / - = Volume    Q = Quit  ",
             font=("Segoe UI", 9), fg="#555", bg="#0d0d1e",
         ).pack(fill=tk.X)
 
@@ -491,6 +495,26 @@ class SmartGlassWin:
             self._set_tts_status("ready")
 
         threading.Thread(target=_infer, daemon=True, name="action").start()
+
+    def _read_stored(self):
+        """R key — speak back the text captured by the last A press in OCR
+        mode. Capture and playback are separate steps so you only have to
+        hold the camera steady for the quick capture, not the whole read-out."""
+        with self._lock:
+            mode = self._mode
+        if mode != MODE_OCR:
+            return
+
+        ocr_mode = self._modes[MODE_OCR]
+        result = ocr_mode.read_stored()
+        if not result:
+            return
+
+        self._show_result(result)
+        self._log("Reading back captured text…")
+        self._set_tts_status("speaking…")
+        self._tts.speak(result)
+        self._set_tts_status("ready")
 
     def _show_result(self, text: str):
         self._result_var.set(text)

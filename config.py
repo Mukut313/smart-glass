@@ -10,7 +10,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # GPIO Pin Numbers (BCM mode — works with rpi-lgpio on RPi 5)
 # ---------------------------------------------------------------------------
 BUTTON_MODE     = 17   # Cycle through modes
-BUTTON_ACTION   = 27   # Trigger detection / read text
+BUTTON_ACTION   = 27   # Capture frame / trigger detection (object & currency: announce immediately;
+                       #   OCR: snap + OCR + store text in the session — does NOT speak it yet)
+BUTTON_READ     = 24   # Speak back the OCR text most recently stored by ACTION (OCR mode only)
 BUTTON_VOL_UP   = 22   # Volume up
 BUTTON_VOL_DOWN = 23   # Volume down
 BUTTON_DEBOUNCE_MS = 250

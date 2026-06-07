@@ -6,7 +6,8 @@ GPIO chip found on RPi 5.  Install: pip install rpi-lgpio
 
 Wiring (all buttons connect pin → GND; internal pull-ups enabled):
   GPIO 17 → MODE button   (cycle modes)
-  GPIO 27 → ACTION button (trigger detection / read text)
+  GPIO 27 → ACTION button (capture frame / trigger detection)
+  GPIO 24 → READ button   (speak back the last captured OCR text)
   GPIO 22 → VOL UP button
   GPIO 23 → VOL DOWN button
 """
@@ -34,6 +35,7 @@ class ButtonHandler:
     def __init__(self) -> None:
         self._mode_cb:     Optional[Callable] = None
         self._action_cb:   Optional[Callable] = None
+        self._read_cb:     Optional[Callable] = None
         self._vol_up_cb:   Optional[Callable] = None
         self._vol_down_cb: Optional[Callable] = None
 
@@ -42,6 +44,7 @@ class ButtonHandler:
         self._last_press: dict[int, float] = {
             config.BUTTON_MODE:     0.0,
             config.BUTTON_ACTION:   0.0,
+            config.BUTTON_READ:     0.0,
             config.BUTTON_VOL_UP:   0.0,
             config.BUTTON_VOL_DOWN: 0.0,
         }
@@ -56,12 +59,14 @@ class ButtonHandler:
         self,
         mode_cb:     Callable,
         action_cb:   Callable,
+        read_cb:     Callable,
         vol_up_cb:   Callable,
         vol_down_cb: Callable,
     ) -> None:
         """Register application callbacks before calling setup()."""
         self._mode_cb     = mode_cb
         self._action_cb   = action_cb
+        self._read_cb     = read_cb
         self._vol_up_cb   = vol_up_cb
         self._vol_down_cb = vol_down_cb
 
@@ -79,6 +84,7 @@ class ButtonHandler:
         pins = [
             config.BUTTON_MODE,
             config.BUTTON_ACTION,
+            config.BUTTON_READ,
             config.BUTTON_VOL_UP,
             config.BUTTON_VOL_DOWN,
         ]
@@ -127,6 +133,7 @@ class ButtonHandler:
         cb_map = {
             config.BUTTON_MODE:     self._mode_cb,
             config.BUTTON_ACTION:   self._action_cb,
+            config.BUTTON_READ:     self._read_cb,
             config.BUTTON_VOL_UP:   self._vol_up_cb,
             config.BUTTON_VOL_DOWN: self._vol_down_cb,
         }

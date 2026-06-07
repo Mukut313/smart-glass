@@ -59,12 +59,23 @@ class OCRMode(BaseMode):
     def __init__(self) -> None:
         self._reader = None   # lazy-loaded
 
+        # Capture and playback are two separate steps: the CAPTURE button
+        # snaps a frame, runs OCR, and stores the result here; the READ
+        # button speaks whatever is currently stored. This lets the user
+        # hold the camera steady only for the (quick) capture, then move
+        # it away before listening to a (possibly long) read-out.
+        self._stored_text: Optional[str] = None
+        self._stored_lang: str = "en"
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def activate(self) -> None:
         logger.info("OCR mode activated")
+        # Start each OCR session with a clean slate
+        self._stored_text = None
+        self._stored_lang = "en"
         if self._reader is None:
             logger.info("Loading EasyOCR model (Bangla + English) — first use…")
             try:
@@ -87,6 +98,12 @@ class OCRMode(BaseMode):
     # ------------------------------------------------------------------
 
     def process_frame(self, frame: np.ndarray) -> Optional[str]:
+        """
+        CAPTURE step (triggered by the capture/action button): snap the
+        frame, run OCR, store the cleaned-up result for later playback,
+        and return only a short confirmation to speak — NOT the full text.
+        Call read_stored() (triggered by the READ button) to hear it.
+        """
         if self._reader is None:
             return "ইঞ্জিন লোড হয়নি, অনুগ্রহ করে অপেক্ষা করুন"  # engine not loaded
 
@@ -131,16 +148,35 @@ class OCRMode(BaseMode):
             texts.append(text)
 
         if not texts:
+            self._stored_text = None
+            self._stored_lang = "en"
             return "কোনো লেখা পাওয়া যায়নি"  # no text found
 
         combined = " ".join(texts)
         lang = detect_language(combined)
         logger.info("OCR result (lang=%s, %d chars): %s", lang, len(combined), combined[:80])
 
-        # Prefix announcement so the user knows reading is starting
+        # Store for the READ button — capture and playback are deliberately
+        # separate steps (see __init__ note).
+        self._stored_text = combined
+        self._stored_lang = lang
+
         if lang == "bn":
-            return "পড়া হচ্ছে: " + combined   # "Reading: ..."
-        return "Reading: " + combined
+            return "লেখা সংরক্ষণ করা হয়েছে। শুনতে রিড বাটন চাপুন"   # "Text saved. Press READ to listen"
+        return "Text captured. Press the READ button to listen."
+
+    def read_stored(self) -> Optional[str]:
+        """
+        READ step (triggered by the dedicated read/playback button):
+        speak the most recently captured text, or a short notice if
+        nothing has been captured yet in this session.
+        """
+        if not self._stored_text:
+            return "কোনো লেখা সংরক্ষিত নেই। প্রথমে ক্যাপচার করুন"  # "Nothing saved yet. Capture first"
+
+        if self._stored_lang == "bn":
+            return "পড়া হচ্ছে: " + self._stored_text   # "Reading: ..."
+        return "Reading: " + self._stored_text
 
     # ------------------------------------------------------------------
     # Preprocessing

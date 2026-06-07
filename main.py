@@ -83,6 +83,7 @@ class SmartGlass:
         self._buttons.register_callbacks(
             mode_cb     = self._on_mode_press,
             action_cb   = self._on_action_press,
+            read_cb     = self._on_read_press,
             vol_up_cb   = self._on_vol_up,
             vol_down_cb = self._on_vol_down,
         )
@@ -172,6 +173,22 @@ class SmartGlass:
                 self._inferring.clear()
 
         threading.Thread(target=_infer, daemon=True, name="action-infer").start()
+
+    def _on_read_press(self) -> None:
+        """READ button — speaks back the text most recently captured by
+        ACTION in OCR mode. Capture and playback are separate steps so the
+        user only has to hold the camera steady for the quick capture, not
+        through a long read-out. No-op outside OCR mode."""
+        with self._mode_lock:
+            mode_idx = self._current_mode
+
+        if mode_idx != config.MODE_OCR:
+            return
+
+        ocr_mode: OCRMode = self._modes[config.MODE_OCR]  # type: ignore[assignment]
+        result = ocr_mode.read_stored()
+        if result:
+            self._tts.speak(result)
 
     def _on_vol_up(self) -> None:
         self._volume = min(100, self._volume + config.VOLUME_STEP)
