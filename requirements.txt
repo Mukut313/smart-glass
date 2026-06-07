@@ -15,6 +15,10 @@ rpi-lgpio>=0.5
 numpy>=1.24.0
 Pillow>=10.0.0
 
+# Audio / TTS playback
+pygame>=2.5.0
+gTTS>=2.5.0
+
 # Optional: offline voice commands (English only — no Bangla Vosk model exists)
 # vosk>=0.3.45
 # pyaudio>=0.2.13
