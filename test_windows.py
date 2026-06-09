@@ -4,8 +4,7 @@ Windows Development / Testing Script
 Tests all three Smart Glass modes on Windows using:
   - Webcam via OpenCV
   - tkinter window for live camera display
-  - gTTS + pygame for TTS  (supports real Bangla audio, reliable playback)
-  - PowerShell SAPI as offline fallback if no internet
+  - Piper TTS for natural offline speech (falls back to Windows SAPI if not installed)
   - Keyboard keys instead of GPIO buttons
 
 Keyboard controls (click the window first):
@@ -18,7 +17,7 @@ Keyboard controls (click the window first):
   Q  ->  Quit
 
 Install:
-  pip install gtts pygame easyocr ultralytics torch torchvision numpy Pillow
+  pip install easyocr ultralytics torch torchvision numpy Pillow
 """
 
 import os
@@ -74,6 +73,13 @@ YOLO_MODEL_PATH     = os.path.join(BASE_DIR, "models", "yolov8n.pt")
 CURRENCY_MODEL_PATH = os.path.join(BASE_DIR, "models", "currency_mobilenet.pt")
 LABELS_BN_PATH      = os.path.join(BASE_DIR, "assets", "labels_bn.json")
 
+# Piper TTS — drop piper.exe + the .onnx models into models/piper/ to enable
+# natural neural TTS. Falls back to Windows SAPI automatically if not present.
+# Download: https://github.com/rhasspy/piper/releases  (piper_windows_amd64.zip)
+PIPER_EXE      = os.path.join(BASE_DIR, "models", "piper", "piper.exe")
+PIPER_EN_MODEL = os.path.join(BASE_DIR, "models", "piper", "en_US-hfc_female-medium.onnx")
+PIPER_BN_MODEL = os.path.join(BASE_DIR, "models", "piper", "bn_BD-medium.onnx")
+
 OCR_CONFIDENCE           = 0.4
 OBJECT_CONFIDENCE        = 0.50
 CURRENCY_CONFIDENCE      = 0.65
@@ -86,38 +92,28 @@ DISPLAY_W, DISPLAY_H    = 640, 480
 
 
 # ---------------------------------------------------------------------------
-# TTS Engine — gTTS (online, real Bangla) + PowerShell fallback (offline)
+# TTS Engine — Windows SAPI (fully offline, no internet required)
 # ---------------------------------------------------------------------------
 
 class WindowsTTS:
     """
-    Primary:  gTTS + pygame  — real Bangla voice, reliable playback.
-    Fallback: PowerShell SAPI — used automatically when no internet.
+    Offline TTS via Windows SAPI (System.Speech.Synthesis.SpeechSynthesizer).
+    Runs in a background worker thread. English text is spoken; Bangla text
+    is shown on screen (SAPI has no built-in Bangla voice).
     """
 
     def __init__(self, volume: int = 85):
-        self._volume       = max(0, min(100, volume))
+        self._volume     = max(0, min(100, volume))
         self._q: queue.Queue = queue.Queue(maxsize=5)
-        self._stop_event   = threading.Event()
-        self._current_channel = None
-        self._lock         = threading.Lock()
-        self._gtts_ok      = True   # flipped to False if gTTS fails
-
-        # Init pygame mixer once
-        try:
-            import pygame
-            pygame.mixer.pre_init(frequency=22050, size=-16, channels=1, buffer=512)
-            pygame.mixer.init()
-            self._pygame = pygame
-            logger.info("[TTS] pygame mixer ready")
-        except Exception as e:
-            self._pygame = None
-            logger.warning("[TTS] pygame init failed: %s", e)
+        self._stop_event = threading.Event()
+        self._proc       = None
+        self._proc_lock  = threading.Lock()
 
         self._worker = threading.Thread(
             target=self._run, daemon=True, name="tts-worker"
         )
         self._worker.start()
+        logger.info("[TTS] Offline SAPI worker started")
 
     # ------------------------------------------------------------------
     # Public API
@@ -127,10 +123,9 @@ class WindowsTTS:
         if not text or not text.strip():
             return
 
-        # Detect language
-        stripped      = text.replace(" ", "")
-        bangla_ratio  = len(_BANGLA_RE.findall(stripped)) / max(len(stripped), 1)
-        lang          = "bn" if bangla_ratio > 0.25 else "en"
+        stripped     = text.replace(" ", "")
+        bangla_ratio = len(_BANGLA_RE.findall(stripped)) / max(len(stripped), 1)
+        lang         = "bn" if bangla_ratio > 0.25 else "en"
 
         logger.info("[TTS] Queuing (%s): %s", lang, text[:70])
 
@@ -143,13 +138,13 @@ class WindowsTTS:
         self._q.put_nowait((text.strip(), lang))
 
     def stop(self) -> None:
-        """Stop current speech and drain queue."""
         self._stop_event.set()
-        if self._pygame:
-            try:
-                self._pygame.mixer.music.stop()
-            except Exception:
-                pass
+        with self._proc_lock:
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
         while not self._q.empty():
             try:
                 self._q.get_nowait()
@@ -160,67 +155,79 @@ class WindowsTTS:
 
     def set_volume(self, pct: int) -> None:
         self._volume = max(0, min(100, pct))
-        if self._pygame:
-            try:
-                self._pygame.mixer.music.set_volume(self._volume / 100.0)
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Worker
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        logger.info("[TTS] Worker started")
         while True:
             text, lang = self._q.get()
             try:
-                if self._gtts_ok and self._pygame:
-                    self._gtts_speak(text, lang)
+                if os.path.isfile(PIPER_EXE):
+                    self._piper_speak(text, lang)
                 else:
-                    self._ps_speak(text)
+                    self._sapi_speak(text, lang)
             except Exception as exc:
                 logger.error("[TTS] Error: %s", exc)
             finally:
                 self._q.task_done()
 
     # ------------------------------------------------------------------
-    # gTTS + pygame backend
+    # Piper TTS backend (natural neural voice, fully offline)
     # ------------------------------------------------------------------
 
-    def _gtts_speak(self, text: str, lang: str) -> None:
-        from gtts import gTTS, gTTSError
+    def _piper_speak(self, text: str, lang: str) -> None:
+        model = PIPER_BN_MODEL if lang == "bn" else PIPER_EN_MODEL
+        if not os.path.isfile(model):
+            logger.warning("[TTS] Piper model not found for lang=%s, falling back to SAPI", lang)
+            self._sapi_speak(text, lang)
+            return
 
         tmp_path = None
         try:
-            logger.info("[TTS] gTTS generating (%s): %s", lang, text[:60])
-            tts = gTTS(text=text, lang=lang, slow=False)
-
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp_path = f.name
-            tts.save(tmp_path)
 
-            logger.info("[TTS] Playing via pygame…")
-            self._pygame.mixer.music.load(tmp_path)
-            self._pygame.mixer.music.set_volume(self._volume / 100.0)
-            self._pygame.mixer.music.play()
+            # Render text → WAV
+            piper_proc = subprocess.Popen(
+                [PIPER_EXE, "--model", model, "--output_file", tmp_path],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            piper_proc.stdin.write(text.encode("utf-8"))
+            piper_proc.stdin.close()
+            piper_proc.wait()
 
-            # Wait until done or stop() called
-            while self._pygame.mixer.music.get_busy():
+            if self._stop_event.is_set():
+                return
+
+            # Play WAV via PowerShell SoundPlayer (blocking, killable)
+            escaped = tmp_path.replace("\\", "\\\\")
+            play_script = (
+                f"$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync()"
+            )
+            proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-WindowStyle", "Hidden", "-Command", play_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with self._proc_lock:
+                self._proc = proc
+
+            while proc.poll() is None:
                 if self._stop_event.is_set():
-                    self._pygame.mixer.music.stop()
+                    proc.terminate()
                     break
                 time.sleep(0.05)
 
-            self._pygame.mixer.music.unload()
-            logger.info("[TTS] Done")
+            logger.info("[TTS] Piper done")
 
         except Exception as exc:
-            logger.warning("[TTS] gTTS failed (%s) — switching to offline fallback", exc)
-            self._gtts_ok = False
-            # Fallback: tell user offline mode
-            fallback = text if lang == "en" else f"Bangla text shown on screen."
-            self._ps_speak(fallback)
+            logger.warning("[TTS] Piper failed (%s), falling back to SAPI", exc)
+            self._sapi_speak(text, lang)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -229,25 +236,37 @@ class WindowsTTS:
                     pass
 
     # ------------------------------------------------------------------
-    # PowerShell SAPI fallback (offline, English only)
+    # Windows SAPI backend (offline fallback)
     # ------------------------------------------------------------------
 
-    def _ps_speak(self, text: str) -> None:
-        safe = text.replace("'", "''")
+    def _sapi_speak(self, text: str, lang: str) -> None:
+        # SAPI has no Bangla voice — speak a short English cue instead so
+        # the developer knows text was captured; Bangla content is visible
+        # in the result label and log box.
+        speak_text = text if lang == "en" else "Bangla text captured. See screen."
+        safe = speak_text.replace("'", "''")
         script = (
             "Add-Type -AssemblyName System.Speech; "
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
             f"$s.Volume = {self._volume}; $s.Rate = 1; $s.Speak('{safe}');"
         )
-        logger.info("[TTS] PowerShell fallback: %s", text[:60])
+        logger.info("[TTS] SAPI: %s", speak_text[:60])
         proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-NonInteractive",
              "-WindowStyle", "Hidden", "-Command", script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        proc.wait()
-        logger.info("[TTS] Done (offline)")
+        with self._proc_lock:
+            self._proc = proc
+
+        while proc.poll() is None:
+            if self._stop_event.is_set():
+                proc.terminate()
+                break
+            time.sleep(0.05)
+
+        logger.info("[TTS] Done (SAPI)")
 
 
 # ---------------------------------------------------------------------------
@@ -549,9 +568,9 @@ class SmartGlassWin:
 
 def main():
     print("=" * 55)
-    print("  Smart Glass — Windows Test (gTTS + pygame)")
+    print("  Smart Glass — Windows Test (Piper / SAPI TTS)")
     print("=" * 55)
-    print("  Requires internet for gTTS (falls back to SAPI if offline)")
+    print("  No internet required — Piper if installed, else Windows SAPI")
     print()
 
     root = tk.Tk()
